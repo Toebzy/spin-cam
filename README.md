@@ -1,8 +1,7 @@
 # SpinCam
 
-SpinCam is a Windows desktop webcam preview with playful PowerPoint-style slide
-transitions. It can send the processed frames to OBS Virtual Camera, which you
-can select as your camera in Discord.
+SpinCam is a Windows desktop webcam preview with  PowerPoint-style slide
+transitions.
 
 ## Setup
 
@@ -26,14 +25,6 @@ can select as your camera in Discord.
    webcam is not listed, reconnect it and click **Refresh**.
 6. In Discord, open **User Settings → Voice & Video → Camera** and select
    **OBS Virtual Camera**.
-
-Choose a transition (3D Spin, Push, Wipe, Checkerboard, Pixel Dissolve, Iris,
-Zoom, or Fade), then click **Play transition** or press the selected global
-function key (F6–F12). The hotkey works while SpinCam is in the background.
-3D Spin makes one full turn with a stronger tilt and a small outward zoom.
-SpinCam opens at its minimum window size with **Clean (1280x720)** selected.
-Lower options include Retro, Crunchy, Extra crunchy, Potato, and Cursed.
-Filters include Noir, Sepia, Negative, Posterize, VHS, and Thermal.
 
 ## Notes
 

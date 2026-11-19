@@ -10,265 +10,107 @@ import cv2
 import numpy as np
 import pyvirtualcam
 from cv2_enumerate_cameras import CameraInfo, enumerate_cameras
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageTk
 from pynput import keyboard
 
 
-OUTPUT_WIDTH = 1280
-OUTPUT_HEIGHT = 720
-OUTPUT_FPS = 30
-SPIN_DURATION = 1.1
-SPIN_TURNS = 1
-TILT_DEGREES = 12
-BACKGROUND = (30, 33, 40)
-HOTKEYS = ("F6", "F7", "F8", "F9", "F10", "F11", "F12")
-TRANSITIONS = (
-    "3D Spin",
-    "Push",
-    "Wipe",
-    "Checkerboard",
-    "Pixel Dissolve",
-    "Iris",
-    "Zoom",
-    "Fade",
+class CameraConnectionError(RuntimeError):
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__(message)
+        self.title = title
+
+
+def classify_camera_error(camera_name: str, error: BaseException) -> CameraConnectionError:
+    text = str(error).lower()
+    if isinstance(error, CameraConnectionError):
+        return error
+    if "busy" in text or "used" in text or "in use" in text:
+        return CameraConnectionError(
+            "Camera already in use",
+            f"{camera_name} is already being used by another app.\n\n"
+            "Close apps that use the camera, then try connecting again.",
+        )
+    if "not opened" in text or "could not open" in text:
+        return CameraConnectionError(
+            "Camera unavailable",
+            f"Could not open {camera_name}.\n\n"
+            "It may be disconnected or reserved by another app.",
+        )
+    return CameraConnectionError(
+        "Camera stopped",
+        f"{camera_name} stopped sending frames.\n\n"
+        "Reconnect or refresh the camera and try again.",
+    )
+
+from core.config import (
+    DEFAULT_QUALITY,
+    FILTERS,
+    HOTKEYS,
+    OUTPUT_FPS,
+    OUTPUT_HEIGHT,
+    OUTPUT_WIDTH,
+    PASSIVE_MOVEMENTS,
+    QUALITY_PRESETS,
+    SHAPE_TRANSITION_DURATION,
+    SPIN_DURATION,
+    TRANSFORM_CORNERS,
+    TRANSFORM_PRESETS,
+    TRANSITIONS,
 )
-FILTERS = ("None", "Noir", "Sepia", "Negative", "Posterize", "VHS", "Thermal")
-QUALITY_PRESETS = {
-    "Clean (1280x720)": (OUTPUT_WIDTH, OUTPUT_HEIGHT),
-    "Retro (640x360)": (640, 360),
-    "Crunchy (320x180)": (320, 180),
-    "Extra crunchy (160x90)": (160, 90),
-    "Potato (80x45)": (80, 45),
-    "Cursed (40x22)": (40, 22),
-}
-DEFAULT_QUALITY = "Clean (1280x720)"
-_checker_rows, _checker_columns = np.indices((18, 32))
-_checker_diagonal = (_checker_rows + _checker_columns) / (
-    _checker_rows.max() + _checker_columns.max()
+from core.video_processing import (
+    apply_bounded_ping_pong,
+    apply_positioned_ping_pong,
+    PingPongMotionState,
+    apply_corner_transform,
+    apply_filter,
+    apply_native_crop,
+    apply_quality,
+    create_app_icon,
+    fit_to_output,
+    apply_passive_motion,
+    interpolate_shape_corners,
+    render_transition,
+    shift_crop_margins,
+    stretch_to_output,
 )
-_CHECKERBOARD_RANKS = (
-    ((_checker_rows + _checker_columns) % 2) * 0.45 + _checker_diagonal * 0.55
-)
-_DISSOLVE_RANKS = (
-    np.random.default_rng(17).permutation(22 * 40).reshape(22, 40) / (22 * 40 - 1)
-)
-_VHS_SCANLINES = np.ones((OUTPUT_HEIGHT, 1, 1), dtype=np.float32)
-_VHS_SCANLINES[::4] = 0.72
-
-
-def create_app_icon() -> Image.Image:
-    """Draw a small camera icon with a circular spin arrow."""
-    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((2, 2, 62, 62), radius=14, fill="#7557e8")
-    draw.polygon([(17, 22), (22, 15), (39, 15), (45, 22)], fill="#f7f8ff")
-    draw.rounded_rectangle((8, 21, 56, 52), radius=6, fill="#f7f8ff")
-    draw.ellipse((19, 26, 44, 50), fill="#212846", outline="#54d8ed", width=3)
-    draw.ellipse((27, 34, 36, 43), fill="#54d8ed")
-    draw.ellipse((42, 40, 62, 60), fill="#ffc857")
-    draw.arc((46, 43, 58, 57), start=205, end=25, fill="#212846", width=2)
-    draw.polygon([(56, 43), (61, 45), (57, 49)], fill="#212846")
-    return image
-
-
-def crop_to_output(frame: np.ndarray) -> np.ndarray:
-    """Center-crop a camera frame to 16:9 and resize it for virtual-camera output."""
-    height, width = frame.shape[:2]
-    target_ratio = OUTPUT_WIDTH / OUTPUT_HEIGHT
-    source_ratio = width / height
-
-    if source_ratio > target_ratio:
-        cropped_width = int(height * target_ratio)
-        left = (width - cropped_width) // 2
-        frame = frame[:, left : left + cropped_width]
-    else:
-        cropped_height = int(width / target_ratio)
-        top = (height - cropped_height) // 2
-        frame = frame[top : top + cropped_height, :]
-
-    interpolation = (
-        cv2.INTER_AREA
-        if frame.shape[1] >= OUTPUT_WIDTH and frame.shape[0] >= OUTPUT_HEIGHT
-        else cv2.INTER_LINEAR
-    )
-    return cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=interpolation)
-
-
-def transform_frame(
-    frame: np.ndarray, yaw_radians: float, scale: float = 1.0
-) -> np.ndarray:
-    """Project the camera image as a slightly tilted 3D plane."""
-    width, height = OUTPUT_WIDTH, OUTPUT_HEIGHT
-    half_width, half_height = width / 2, height / 2
-    tilt = np.deg2rad(TILT_DEGREES)
-    cos_yaw, sin_yaw = np.cos(yaw_radians), np.sin(yaw_radians)
-    cos_tilt, sin_tilt = np.cos(tilt), np.sin(tilt)
-
-    rotation_y = np.array(
-        [[cos_yaw, 0, sin_yaw], [0, 1, 0], [-sin_yaw, 0, cos_yaw]]
-    )
-    rotation_x = np.array(
-        [[1, 0, 0], [0, cos_tilt, -sin_tilt], [0, sin_tilt, cos_tilt]]
-    )
-    corners = np.array(
-        [
-            [-half_width, -half_height, 0],
-            [half_width, -half_height, 0],
-            [half_width, half_height, 0],
-            [-half_width, half_height, 0],
-        ],
-        dtype=np.float64,
-    )
-    rotated = corners @ (rotation_y @ rotation_x).T
-    focal_length = width * 1.8
-    perspective = focal_length / (focal_length - rotated[:, 2])
-    destination = np.column_stack(
-        (
-            half_width + rotated[:, 0] * perspective,
-            half_height + rotated[:, 1] * perspective,
-        )
-    ).astype(np.float32)
-    center = np.array([half_width, half_height], dtype=np.float32)
-    destination = center + (destination - center) * scale
-    source = np.array(
-        [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
-        dtype=np.float32,
-    )
-    matrix = cv2.getPerspectiveTransform(source, destination)
-    return cv2.warpPerspective(
-        frame,
-        matrix,
-        (width, height),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=BACKGROUND,
-    )
-
-
-def render_transition(
-    previous: np.ndarray,
-    current: np.ndarray,
-    name: str,
-    progress: float,
-) -> np.ndarray:
-    """Blend a frozen frame into the live camera using a slide-style transition."""
-    progress = float(np.clip(progress, 0, 1))
-    if progress >= 1:
-        return current
-    if name == "3D Spin":
-        zoom_pulse = 1 + 0.16 * np.sin(np.pi * progress)
-        return transform_frame(
-            current, progress * 2 * np.pi * SPIN_TURNS, zoom_pulse
-        )
-    if progress <= 0:
-        return previous.copy()
-
-    height, width = current.shape[:2]
-    if name == "Fade":
-        return cv2.addWeighted(previous, 1 - progress, current, progress, 0)
-    if name == "Push":
-        offset = int(width * progress)
-        result = current.copy()
-        result[:, : width - offset] = previous[:, offset:]
-        return result
-    if name == "Wipe":
-        cutoff = int(width * progress)
-        result = previous.copy()
-        result[:, :cutoff] = current[:, :cutoff]
-        return result
-    if name == "Checkerboard":
-        mask = cv2.resize(
-            (_CHECKERBOARD_RANKS < progress).astype(np.uint8),
-            (width, height),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        return np.where(mask[:, :, None] != 0, current, previous)
-    if name == "Pixel Dissolve":
-        mask = cv2.resize(
-            (_DISSOLVE_RANKS < progress).astype(np.uint8),
-            (width, height),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        return np.where(mask[:, :, None] != 0, current, previous)
-    if name == "Iris":
-        mask = np.zeros((height, width), dtype=np.uint8)
-        radius = int(np.hypot(width / 2, height / 2) * progress)
-        cv2.circle(mask, (width // 2, height // 2), radius, 1, thickness=-1)
-        return np.where(mask[:, :, None] != 0, current, previous)
-    if name == "Zoom":
-        scale = 1 - progress
-        scaled_width = max(1, int(width * scale))
-        scaled_height = max(1, int(height * scale))
-        scaled = cv2.resize(previous, (scaled_width, scaled_height))
-        result = current.copy()
-        left = (width - scaled_width) // 2
-        top = (height - scaled_height) // 2
-        result[top : top + scaled_height, left : left + scaled_width] = scaled
-        return result
-    raise ValueError(f"Unknown transition: {name}")
-
-
-def apply_quality(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    """Render a deliberately pixelated camera image at the chosen preview size."""
-    if size == (OUTPUT_WIDTH, OUTPUT_HEIGHT):
-        return frame
-    small = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
-    return cv2.resize(
-        small, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_NEAREST
-    )
-
-
-def apply_filter(frame: np.ndarray, name: str) -> np.ndarray:
-    """Apply a selected live-video filter to a BGR camera frame."""
-    if name == "None":
-        return frame
-    if name == "Noir":
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    if name == "Sepia":
-        matrix = np.array(
-            [
-                [0.272, 0.534, 0.131],
-                [0.349, 0.686, 0.168],
-                [0.393, 0.769, 0.189],
-            ],
-            dtype=np.float32,
-        )
-        return cv2.transform(frame, matrix).clip(0, 255).astype(np.uint8)
-    if name == "Negative":
-        return cv2.bitwise_not(frame)
-    if name == "Posterize":
-        return np.minimum((frame // 64) * 64 + 32, 255).astype(np.uint8)
-    if name == "VHS":
-        result = frame.copy()
-        result[:, :, 2] = np.roll(frame[:, :, 2], 3, axis=1)
-        return np.clip(
-            result.astype(np.float32) * _VHS_SCANLINES, 0, 255
-        ).astype(np.uint8)
-    if name == "Thermal":
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return cv2.applyColorMap(gray, cv2.COLORMAP_JET)
-    raise ValueError(f"Unknown filter: {name}")
 
 
 class SpinCamApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("")
-        self.root.minsize(820, 650)
-        self.root.geometry("820x650")
+        self.root.minsize(720, 560)
+        self.root.geometry("720x560")
         self.app_icon = ImageTk.PhotoImage(create_app_icon())
         self.root.iconphoto(True, self.app_icon)
 
-        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.events: queue.Queue[tuple[str, object, object | None]] = queue.Queue()
         self.frame_lock = threading.Lock()
         self.state_lock = threading.Lock()
         self.latest_frame: np.ndarray | None = None
+        self.latest_preview_frame: np.ndarray | None = None
         self.spin_started: float | None = None
         self.active_transition = "3D Spin"
         self.transition_snapshot: np.ndarray | None = None
         self.selected_quality = QUALITY_PRESETS[DEFAULT_QUALITY]
         self.selected_filter = "None"
+        self.selected_transform = "Off"
+        self.selected_passive_movement = "Off"
+        self.passive_motion_started: float | None = None
+        self.transform_corners = [
+            list(point) for point in TRANSFORM_CORNERS["Off"]
+        ]
+        self.shape_transition_from: tuple[tuple[float, float], ...] | None = None
+        self.shape_transition_started: float | None = None
+        self.dragged_corner: int | None = None
+        self.crop_enabled = False
+        self.crop_left = 0.0
+        self.crop_top = 0.0
+        self.crop_right = 0.0
+        self.crop_bottom = 0.0
+        self.dragged_crop_edge: str | None = None
+        self.dragged_crop_start: tuple[float, float] | None = None
+        self.dragged_crop_margins: tuple[float, float, float, float] | None = None
         self.camera_devices: dict[str, CameraInfo] = {}
         self.device_scan_running = False
         self.stop_event: threading.Event | None = None
@@ -279,8 +121,12 @@ class SpinCamApp:
         self.transition = tk.StringVar(value="3D Spin")
         self.quality = tk.StringVar(value=DEFAULT_QUALITY)
         self.video_filter = tk.StringVar(value="None")
+        self.transform = tk.StringVar(value="Off")
+        self.passive_movement = tk.StringVar(value="Off")
+        self.crop_enabled_var = tk.BooleanVar(value=False)
         self.hotkey = tk.StringVar(value="F8")
         self.status = tk.StringVar(value="Camera stopped")
+        self.preview_image_size = (0, 0)
 
         self._build_ui()
         self._refresh_cameras()
@@ -289,7 +135,7 @@ class SpinCamApp:
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
     def _build_ui(self) -> None:
-        container = ttk.Frame(self.root, padding=20)
+        container = ttk.Frame(self.root, padding=(20, 0, 20, 20))
         container.pack(fill=tk.BOTH, expand=True)
         device_controls = ttk.LabelFrame(container, text="Webcam", padding=10)
         device_controls.pack(fill=tk.X, pady=(0, 12))
@@ -323,14 +169,10 @@ class SpinCamApp:
         self.disconnect_button.grid(row=0, column=4)
         device_controls.columnconfigure(1, weight=1)
 
-        self.preview = tk.Label(
+        self.preview = tk.Canvas(
             container,
-            text="No camera connected",
-            bg="#1e2128",
-            fg="#f0f0f0",
-            font=("Segoe UI", 12),
-            width=80,
-            height=18,
+            bg="#000000",
+            highlightthickness=0,
         )
         self.preview.pack(fill=tk.BOTH, expand=True)
 
@@ -388,6 +230,58 @@ class SpinCamApp:
         )
         hotkey_selector.grid(row=1, column=3, padx=(0, 12), sticky=tk.W)
         hotkey_selector.bind("<<ComboboxSelected>>", self._change_hotkey)
+
+        frame_controls = ttk.Frame(container, padding=(0, 12, 0, 0))
+        frame_controls.pack(fill=tk.X)
+
+        shape_controls = ttk.LabelFrame(frame_controls, text="Shape", padding=8)
+        shape_controls.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        ttk.Label(shape_controls, text="Preset").pack(side=tk.LEFT)
+        transform_selector = ttk.Combobox(
+            shape_controls,
+            textvariable=self.transform,
+            values=TRANSFORM_PRESETS,
+            state="readonly",
+            width=16,
+        )
+        transform_selector.pack(side=tk.LEFT, padx=(6, 8))
+        transform_selector.bind("<<ComboboxSelected>>", self._change_transform)
+        ttk.Button(
+            shape_controls, text="Reset", command=self._reset_transform
+        ).pack(side=tk.LEFT)
+
+        motion_controls = ttk.LabelFrame(
+            frame_controls, text="Passive movement", padding=8
+        )
+        motion_controls.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        ttk.Label(motion_controls, text="Motion").pack(side=tk.LEFT)
+        movement_selector = ttk.Combobox(
+            motion_controls,
+            textvariable=self.passive_movement,
+            values=PASSIVE_MOVEMENTS,
+            state="readonly",
+            width=12,
+        )
+        movement_selector.pack(side=tk.LEFT, padx=(6, 0))
+        movement_selector.bind(
+            "<<ComboboxSelected>>", self._change_passive_movement
+        )
+
+        crop_controls = ttk.LabelFrame(frame_controls, text="Crop", padding=8)
+        crop_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Checkbutton(
+            crop_controls,
+            text="Enable crop",
+            variable=self.crop_enabled_var,
+            command=self._toggle_crop,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(
+            crop_controls, text="Reset", command=self._reset_crop
+        ).pack(side=tk.RIGHT)
+
+        self.preview.bind("<ButtonPress-1>", self._start_edit_drag)
+        self.preview.bind("<B1-Motion>", self._edit_drag)
+        self.preview.bind("<ButtonRelease-1>", self._stop_edit_drag)
         ttk.Label(container, textvariable=self.status).pack(anchor=tk.W, pady=(12, 0))
 
     def _refresh_cameras(self) -> None:
@@ -407,7 +301,9 @@ class SpinCamApp:
             if not cameras:
                 cameras = enumerate_cameras(cv2.CAP_MSMF)
         except (RuntimeError, OSError, cv2.error) as error:
-            self.events.put(("devices_error", str(error)))
+            self.events.put(
+                ("devices_error", "Could not scan for cameras.", str(error))
+            )
         else:
             self.events.put(("devices", cameras))
 
@@ -418,6 +314,12 @@ class SpinCamApp:
                 "No webcam selected", "Choose an available webcam, then connect."
             )
             return
+        if self.camera_thread is not None and self.camera_thread.is_alive():
+            return
+
+        with self.state_lock:
+            if self.selected_passive_movement != "Off":
+                self.passive_motion_started = time.monotonic()
 
         self.stop_event = threading.Event()
         self.camera_thread = threading.Thread(
@@ -456,6 +358,190 @@ class SpinCamApp:
         with self.state_lock:
             self.selected_filter = self.video_filter.get()
 
+    def _toggle_crop(self) -> None:
+        with self.state_lock:
+            self.crop_enabled = self.crop_enabled_var.get()
+        self.status.set(
+            "Crop enabled. Drag the cyan edges directly."
+            if self.crop_enabled
+            else "Crop disabled."
+        )
+
+    def _change_passive_movement(self, _event: tk.Event) -> None:
+        mode = self.passive_movement.get()
+        with self.state_lock:
+            self.selected_passive_movement = mode
+            self.passive_motion_started = (
+                time.monotonic() if mode != "Off" else None
+            )
+        self.status.set(
+            f"Passive movement: {mode}."
+            if mode != "Off"
+            else "Passive movement off."
+        )
+
+    def _reset_crop(self) -> None:
+        self.crop_enabled_var.set(False)
+        with self.state_lock:
+            self.crop_enabled = False
+            self.crop_left = 0.0
+            self.crop_top = 0.0
+            self.crop_right = 0.0
+            self.crop_bottom = 0.0
+        self.status.set("Crop reset.")
+
+    def _change_transform(self, _event: tk.Event) -> None:
+        preset = self.transform.get()
+        with self.state_lock:
+            source = self._shape_corners_at_locked(time.monotonic())
+            self.selected_transform = preset
+            self.transform_corners = [
+                list(point) for point in TRANSFORM_CORNERS[preset]
+            ]
+            self.shape_transition_from = source
+            self.shape_transition_started = time.monotonic()
+        self.status.set(
+            f"{preset} shape active. Drag any of the four preview corners."
+            if preset != "Off"
+            else "Shape reset to full frame."
+        )
+
+    def _reset_transform(self) -> None:
+        self.transform.set("Off")
+        with self.state_lock:
+            source = self._shape_corners_at_locked(time.monotonic())
+            self.selected_transform = "Off"
+            self.transform_corners = [
+                list(point) for point in TRANSFORM_CORNERS["Off"]
+            ]
+            self.shape_transition_from = source
+            self.shape_transition_started = time.monotonic()
+        self.status.set("Shape reset to full frame.")
+
+    def _shape_corners_at_locked(
+        self, now: float
+    ) -> tuple[tuple[float, float], ...]:
+        target = tuple(tuple(point) for point in self.transform_corners)
+        if (
+            self.shape_transition_from is None
+            or self.shape_transition_started is None
+        ):
+            return target
+        progress = (now - self.shape_transition_started) / SHAPE_TRANSITION_DURATION
+        return interpolate_shape_corners(
+            self.shape_transition_from, target, progress
+        )
+
+    def _preview_point_to_normalized(self, x: int, y: int) -> tuple[float, float]:
+        preview_width = self.preview.winfo_width()
+        preview_height = self.preview.winfo_height()
+        image_width, image_height = self.preview_image_size
+        if preview_width <= 0 or preview_height <= 0 or not image_width:
+            return (0.0, 0.0)
+        offset_x = max(0, (preview_width - image_width) // 2)
+        offset_y = max(0, (preview_height - image_height) // 2)
+        return (
+            float(np.clip((x - offset_x) / image_width, -0.20, 1.20)),
+            float(np.clip((y - offset_y) / image_height, -0.20, 1.20)),
+        )
+
+    def _start_edit_drag(self, event: tk.Event) -> None:
+        point = self._preview_point_to_normalized(event.x, event.y)
+        if self.crop_enabled:
+            distances = {
+                "left": abs(point[0] - self.crop_left),
+                "top": abs(point[1] - self.crop_top),
+                "right": abs(point[0] - (1.0 - self.crop_right)),
+                "bottom": abs(point[1] - (1.0 - self.crop_bottom)),
+            }
+            edge = min(distances, key=distances.get)
+            if distances[edge] <= 0.12:
+                self.dragged_crop_edge = edge
+                self.dragged_corner = None
+                return
+            left = self.crop_left
+            top = self.crop_top
+            right = 1.0 - self.crop_right
+            bottom = 1.0 - self.crop_bottom
+            if left <= point[0] <= right and top <= point[1] <= bottom:
+                self.dragged_crop_start = point
+                self.dragged_crop_margins = (
+                    left,
+                    top,
+                    self.crop_right,
+                    self.crop_bottom,
+                )
+                self.dragged_corner = None
+                return
+
+        nearest = min(
+            range(4),
+            key=lambda index: (
+                (point[0] - self.transform_corners[index][0]) ** 2
+                + (point[1] - self.transform_corners[index][1]) ** 2
+            ),
+        )
+        corner = self.transform_corners[nearest]
+        distance = ((point[0] - corner[0]) ** 2 + (point[1] - corner[1]) ** 2) ** 0.5
+        if distance <= 0.18:
+            with self.state_lock:
+                current = self._shape_corners_at_locked(time.monotonic())
+                self.transform_corners = [list(point) for point in current]
+                self.shape_transition_from = None
+                self.shape_transition_started = None
+            self.dragged_corner = nearest
+
+    def _edit_drag(self, event: tk.Event) -> None:
+        point = self._preview_point_to_normalized(event.x, event.y)
+        if (
+            self.dragged_crop_start is not None
+            and self.dragged_crop_margins is not None
+        ):
+            left, top, right, bottom = shift_crop_margins(
+                self.dragged_crop_margins,
+                point[0] - self.dragged_crop_start[0],
+                point[1] - self.dragged_crop_start[1],
+            )
+            with self.state_lock:
+                self.crop_left = left
+                self.crop_top = top
+                self.crop_right = right
+                self.crop_bottom = bottom
+            return
+
+        if self.dragged_crop_edge is not None:
+            edge = self.dragged_crop_edge
+            if edge == "left":
+                value = float(np.clip(point[0], 0.0, 1.0 - self.crop_right - 0.10))
+                with self.state_lock:
+                    self.crop_left = value
+            elif edge == "top":
+                value = float(np.clip(point[1], 0.0, 1.0 - self.crop_bottom - 0.10))
+                with self.state_lock:
+                    self.crop_top = value
+            elif edge == "right":
+                value = float(np.clip(1.0 - point[0], 0.0, 1.0 - self.crop_left - 0.10))
+                with self.state_lock:
+                    self.crop_right = value
+            else:
+                value = float(np.clip(1.0 - point[1], 0.0, 1.0 - self.crop_top - 0.10))
+                with self.state_lock:
+                    self.crop_bottom = value
+            return
+
+        if self.dragged_corner is None:
+            return
+        with self.state_lock:
+            self.transform_corners[self.dragged_corner] = list(point)
+            self.selected_transform = "Custom"
+        self.transform.set("Custom")
+
+    def _stop_edit_drag(self, _event: tk.Event) -> None:
+        self.dragged_corner = None
+        self.dragged_crop_edge = None
+        self.dragged_crop_start = None
+        self.dragged_crop_margins = None
+
     def _start_hotkey_listener(self) -> None:
         self._stop_hotkey_listener()
         key = self.hotkey.get().lower()
@@ -488,12 +574,25 @@ class SpinCamApp:
         try:
             capture = cv2.VideoCapture(camera.index, camera.backend)
             if not capture.isOpened():
-                raise RuntimeError(
-                    f"Could not open {camera.name}. Check that it is connected "
-                    "and not already in use."
+                raise CameraConnectionError(
+                    "Camera unavailable",
+                    f"{camera.name} could not be opened. It may be disconnected "
+                    "or already in use by another app.",
                 )
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, OUTPUT_WIDTH)
             capture.set(cv2.CAP_PROP_FRAME_HEIGHT, OUTPUT_HEIGHT)
+            capture.set(cv2.CAP_PROP_FPS, OUTPUT_FPS)
+            for _ in range(5):
+                success, frame = capture.read()
+                if success and frame is not None and frame.size:
+                    break
+                time.sleep(0.1)
+            else:
+                raise CameraConnectionError(
+                    "Camera already in use",
+                    f"{camera.name} opened but returned no frames.\n\n"
+                    "Close apps using the camera and try again.",
+                )
             try:
                 virtual_camera = pyvirtualcam.Camera(
                     width=OUTPUT_WIDTH,
@@ -511,20 +610,61 @@ class SpinCamApp:
                     )
                 )
 
+            ping_pong_state = PingPongMotionState()
+            ping_pong_started: float | None = None
+            previous_frame_time = time.monotonic()
             while not stop_event.is_set():
                 success, frame = capture.read()
-                if not success:
-                    raise RuntimeError("The camera stopped sending frames.")
-
-                frame = crop_to_output(frame)
+                if not success or frame is None or not frame.size:
+                    raise CameraConnectionError(
+                        "Camera stopped",
+                        f"{camera.name} stopped sending frames.\n\n"
+                        "Reconnect or refresh the camera and try again.",
+                    )
                 now = time.monotonic()
                 with self.state_lock:
                     spin_started = self.spin_started
                     active_transition = self.active_transition
                     snapshot = self.transition_snapshot
                     selected_filter = self.selected_filter
-
-                frame = apply_filter(frame, selected_filter)
+                    selected_transform = self.selected_transform
+                    transform_corners = tuple(
+                        point
+                        for point in self._shape_corners_at_locked(now)
+                    )
+                    shape_transition_active = (
+                        self.shape_transition_from is not None
+                        and self.shape_transition_started is not None
+                    )
+                    if (
+                        shape_transition_active
+                        and now - self.shape_transition_started
+                        >= SHAPE_TRANSITION_DURATION
+                    ):
+                        self.shape_transition_from = None
+                        self.shape_transition_started = None
+                    selected_passive_movement = self.selected_passive_movement
+                    passive_motion_started = self.passive_motion_started
+                    crop_enabled = self.crop_enabled
+                    crop_margins = (
+                        self.crop_left,
+                        self.crop_top,
+                        self.crop_right,
+                        self.crop_bottom,
+                    )
+                if selected_passive_movement == "Ping-Pong":
+                    if ping_pong_started != passive_motion_started:
+                        ping_pong_state = PingPongMotionState()
+                        ping_pong_started = passive_motion_started
+                        previous_frame_time = now
+                    else:
+                        ping_pong_state.advance(now - previous_frame_time)
+                        previous_frame_time = now
+                preview_frame = frame.copy()
+                if crop_enabled:
+                    frame = apply_native_crop(frame, *crop_margins)
+                frame = apply_filter(frame, selected_filter, now)
+                frame = stretch_to_output(frame) if crop_enabled else fit_to_output(frame)
 
                 if spin_started is not None:
                     progress = min((now - spin_started) / SPIN_DURATION, 1.0)
@@ -547,6 +687,46 @@ class SpinCamApp:
                                 self.spin_started = None
                                 self.transition_snapshot = None
 
+                shape_transform_active = (
+                    selected_transform != "Off" or shape_transition_active
+                )
+                is_bounded_ping_pong = (
+                    selected_passive_movement == "Ping-Pong"
+                    and shape_transform_active
+                )
+                if (
+                    selected_passive_movement != "Off"
+                    and passive_motion_started is not None
+                    and not is_bounded_ping_pong
+                    and selected_passive_movement != "Ping-Pong"
+                ):
+                    frame = apply_passive_motion(
+                        frame,
+                        selected_passive_movement,
+                        now - passive_motion_started,
+                    )
+                if shape_transform_active:
+                    frame = apply_corner_transform(frame, transform_corners)
+                if (
+                    is_bounded_ping_pong
+                    and passive_motion_started is not None
+                ):
+                    frame = apply_bounded_ping_pong(
+                        frame,
+                        transform_corners,
+                        ping_pong_state.x,
+                        ping_pong_state.y,
+                    )
+                elif (
+                    selected_passive_movement == "Ping-Pong"
+                    and passive_motion_started is not None
+                ):
+                    frame = apply_positioned_ping_pong(
+                        frame,
+                        ping_pong_state.x,
+                        ping_pong_state.y,
+                    )
+
                 with self.state_lock:
                     quality_size = self.selected_quality
                 frame = apply_quality(frame, quality_size)
@@ -557,9 +737,13 @@ class SpinCamApp:
 
                 with self.frame_lock:
                     self.latest_frame = frame
+                    self.latest_preview_frame = preview_frame
 
-        except (RuntimeError, OSError, cv2.error) as error:
-            self.events.put(("camera_error", str(error)))
+        except (CameraConnectionError, RuntimeError, OSError, cv2.error) as error:
+            classified = classify_camera_error(camera.name, error)
+            self.events.put(
+                ("camera_error", classified.title, classified.args[0])
+            )
         finally:
             if virtual_camera is not None:
                 virtual_camera.close()
@@ -567,12 +751,16 @@ class SpinCamApp:
                 capture.release()
             with self.frame_lock:
                 self.latest_frame = None
+                self.latest_preview_frame = None
             self.events.put(("stopped", ""))
 
     def _poll(self) -> None:
         while True:
             try:
-                event, detail = self.events.get_nowait()
+                item = self.events.get_nowait()
+                event = item[0]
+                detail = item[1]
+                error_detail = item[2] if len(item) > 2 else None
             except queue.Empty:
                 break
 
@@ -594,9 +782,8 @@ class SpinCamApp:
                 if choices:
                     self.camera_device.set(choices[0])
                     self.connect_button.configure(state=tk.NORMAL)
-                    self.status.set(
-                        f"Found {len(choices)} camera(s). Select one and connect."
-                    )
+                    self.status.set(f"Found {len(choices)} camera(s). Connecting...")
+                    self._connect_camera()
                 else:
                     self.camera_device.set("No cameras found")
                     self.status.set(
@@ -610,10 +797,15 @@ class SpinCamApp:
                 self.camera_selector.configure(values=(), state="disabled")
                 self.camera_device.set("Camera scan failed")
                 self.refresh_button.configure(state=tk.NORMAL)
-                self.status.set(f"Camera scan failed: {detail}")
+                self.status.set("Camera scan failed.")
+                messagebox.showerror(
+                    str(detail),
+                    str(error_detail or "Could not scan for connected cameras."),
+                )
             elif event == "camera_error":
-                messagebox.showerror("Camera error", str(detail))
-                self.status.set("Camera stopped.")
+                title = str(detail)
+                messagebox.showerror(title, str(error_detail or "The camera stopped."))
+                self.status.set(title + ".")
             elif event == "virtual_error":
                 self.status.set("Virtual camera unavailable.")
                 messagebox.showerror(
@@ -632,20 +824,105 @@ class SpinCamApp:
                 if self.status.get() not in (
                     "Camera stopped.",
                     "Virtual camera unavailable.",
+                    "Camera already in use.",
+                    "Camera unavailable.",
                 ):
                     self.status.set("Camera stopped.")
 
         with self.frame_lock:
             frame = None if self.latest_frame is None else self.latest_frame.copy()
+            preview_frame = (
+                None
+                if self.latest_preview_frame is None
+                else self.latest_preview_frame.copy()
+            )
         if frame is not None:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if preview_frame is not None:
+                rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
+            else:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             image = Image.fromarray(rgb)
-            image.thumbnail((950, 535), Image.Resampling.LANCZOS)
+            preview_width = max(1, self.preview.winfo_width())
+            preview_height = max(1, self.preview.winfo_height())
+            image.thumbnail(
+                (preview_width, preview_height),
+                Image.Resampling.LANCZOS,
+            )
+            offset_x = max(0, (preview_width - image.width) // 2)
+            offset_y = max(0, (preview_height - image.height) // 2)
+            self.preview_image_size = (image.width, image.height)
+            self.preview.delete("all")
             photo = ImageTk.PhotoImage(image)
-            self.preview.configure(image=photo, text="")
+            self.preview.create_image(
+                offset_x, offset_y, anchor=tk.NW, image=photo
+            )
             self.preview.image = photo
+
+            if self.crop_enabled:
+                x1 = int(offset_x + self.crop_left * image.width)
+                y1 = int(offset_y + self.crop_top * image.height)
+                x2 = int(offset_x + (1.0 - self.crop_right) * image.width)
+                y2 = int(offset_y + (1.0 - self.crop_bottom) * image.height)
+                shade = "#000000"
+                self.preview.create_rectangle(
+                    offset_x, offset_y, offset_x + image.width, y1,
+                    fill=shade, stipple="gray50", outline=""
+                )
+                self.preview.create_rectangle(
+                    offset_x, y2, offset_x + image.width,
+                    offset_y + image.height,
+                    fill=shade, stipple="gray50", outline=""
+                )
+                self.preview.create_rectangle(
+                    offset_x, y1, x1, y2,
+                    fill=shade, stipple="gray50", outline=""
+                )
+                self.preview.create_rectangle(
+                    x2, y1, offset_x + image.width, y2,
+                    fill=shade, stipple="gray50", outline=""
+                )
+                self.preview.create_rectangle(
+                    x1, y1, x2, y2,
+                    outline="",
+                )
+                for handle_x, handle_y in (
+                    (x1, y1),
+                    (x2, y1),
+                    (x2, y2),
+                    (x1, y2),
+                ):
+                    self.preview.create_oval(
+                        handle_x - 7, handle_y - 7,
+                        handle_x + 7, handle_y + 7,
+                        fill="#54d8ed", outline="#212846", width=2
+                    )
+
+            if self.selected_transform != "Off":
+                polygon_points: list[int] = []
+                for corner_x, corner_y in self.transform_corners:
+                    handle_x = int(offset_x + corner_x * image.width)
+                    handle_y = int(offset_y + corner_y * image.height)
+                    polygon_points.extend((handle_x, handle_y))
+                    self.preview.create_oval(
+                        handle_x - 5, handle_y - 5,
+                        handle_x + 5, handle_y + 5,
+                        fill="#ffc857", outline="#000000", width=1
+                    )
+                self.preview.create_polygon(
+                    polygon_points,
+                    outline="#ffc857",
+                    fill="",
+                    width=2,
+                )
         elif self.camera_thread is None or not self.camera_thread.is_alive():
-            self.preview.configure(image="", text="No camera connected")
+            self.preview.delete("all")
+            self.preview.create_text(
+                self.preview.winfo_width() // 2,
+                self.preview.winfo_height() // 2,
+                text="No camera connected",
+                fill="#f0f0f0",
+                font=("Segoe UI", 12),
+            )
             self.preview.image = None
 
         self.root.after(30, self._poll)
